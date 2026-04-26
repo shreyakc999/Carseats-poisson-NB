@@ -1,0 +1,637 @@
+---
+title: "Predicting Advertising Spend: From Poisson to Negative Binomial Regression"
+subtitle: "Poisson Regression with Overdispersion Correction via Negative Binomial"
+author: "Analysis Report"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo      = TRUE,
+  warning   = FALSE,
+  message   = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+
+# Install poissonreg if not already installed
+if (!requireNamespace("poissonreg", quietly = TRUE)) {
+  install.packages("poissonreg")
+}
+```
+
+---
+
+# Introduction
+
+This report models **local advertising spend** across 400 retail carseat locations using data from the `Carseats` dataset in the `ISLR` package. The analysis follows a two-stage approach:
+
+1. We first fit a **Poisson regression model**, which is the natural starting point for count data.
+2. We then diagnose the Poisson model and find significant **overdispersion** (variance far exceeding the mean), which violates a core Poisson assumption and inflates the apparent significance of predictors.
+3. We address this by refitting using a **Negative Binomial regression model**, which relaxes the mean-variance equality constraint and produces more reliable standard errors and inference.
+
+**Response variable:** `Advertising`, the local advertising budget (in thousands of dollars) at each store location.
+
+**Predictors selected:** `Sales`, `Income`, `Price`, and `US`, chosen through correlation analysis and ANOVA testing (detailed in Section 4).
+
+---
+
+# Setup
+
+```{r libraries}
+library(ISLR)
+library(tidymodels)
+library(tidyverse)
+library(GGally)
+library(car)
+library(broom)
+library(gridExtra)
+library(poissonreg)
+library(MASS)
+```
+
+```{r load-data}
+data(Carseats)
+glimpse(Carseats)
+```
+
+```{r summary}
+summary(Carseats)
+```
+
+---
+
+# Why Poisson Regression?
+
+## The Poisson Distribution
+
+Poisson regression models count data by assuming the response variable $Y$ follows a Poisson distribution:
+
+$$P(Y = y) = \frac{e^{-\lambda} \lambda^y}{y!}, \quad y = 0, 1, 2, \ldots$$
+
+where $\lambda = E(Y) = \text{Var}(Y)$ is both the mean and variance of the distribution. The model links predictors to this mean through a **log link function**:
+
+$$\log(\hat{\lambda}_i) = \hat{\beta}_0 + \hat{\beta}_1 x_{i1} + \hat{\beta}_2 x_{i2} + \cdots + \hat{\beta}_p x_{ip}$$
+
+which is equivalent to:
+
+$$\hat{\lambda}_i = e^{\hat{\beta}_0 + \hat{\beta}_1 x_{i1} + \cdots + \hat{\beta}_p x_{ip}}$$
+
+## Why Not Linear Regression?
+
+Linear regression is inappropriate for `Advertising` for three reasons:
+
+- `Advertising` takes only **non-negative integer values** (0 to 29). Linear regression can predict negative values, which are meaningless here.
+- The distribution of `Advertising` is **right-skewed** with a spike at zero, violating the normality assumption of linear regression.
+- The **variance increases with the mean** in count data, which is better handled by the Poisson family.
+
+## Checking the Response Variable
+
+```{r response-check, fig.width=10, fig.height=4}
+cat("Mean of Advertising:    ", round(mean(Carseats$Advertising), 3), "\n")
+cat("Variance of Advertising:", round(var(Carseats$Advertising),  3), "\n")
+cat("Zeros in Advertising:   ", sum(Carseats$Advertising == 0), "\n")
+cat("Max Advertising:        ", max(Carseats$Advertising), "\n")
+
+p1 <- ggplot(Carseats, aes(x = Advertising)) +
+  geom_histogram(binwidth = 1, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = mean(Carseats$Advertising),
+             color = "red", linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title    = "Distribution of Advertising Spend",
+    subtitle = "Right-skewed with a spike at zero, consistent with count data",
+    x = "Advertising Budget (thousands)", y = "Count"
+  ) +
+  theme_bw(base_size = 11)
+
+p2 <- ggplot(Carseats, aes(x = log1p(Advertising))) +
+  geom_histogram(bins = 25, fill = "steelblue", color = "white", alpha = 0.8) +
+  labs(
+    title    = "Log(Advertising + 1) Distribution",
+    subtitle = "Log transformation reveals more symmetric underlying structure",
+    x = "log(Advertising + 1)", y = "Count"
+  ) +
+  theme_bw(base_size = 11)
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+The mean (`r round(mean(Carseats$Advertising), 2)`) and variance (`r round(var(Carseats$Advertising), 2)`) are not equal, which indicates **overdispersion** relative to the strict Poisson assumption. This is common in real data and will be noted in the diagnostics section.
+
+---
+
+# Exploratory Data Analysis
+
+## Advertising vs Numeric Predictors
+
+```{r cor-numeric, fig.width=7, fig.height=4}
+num_vars <- Carseats %>% dplyr::select_if(is.numeric)
+
+cor_with_adv <- cor(num_vars)[, "Advertising"] %>%
+  round(2) %>%
+  enframe(name = "Variable", value = "Correlation") %>%
+  dplyr::filter(Variable != "Advertising") %>%
+  arrange(Correlation) %>%
+  mutate(
+    Direction = ifelse(Correlation > 0, "Positive", "Negative"),
+    Variable  = fct_inorder(Variable)
+  )
+
+cor_with_adv %>%
+  arrange(desc(abs(Correlation))) %>%
+  knitr::kable(
+    caption = "Pearson Correlations with Advertising (sorted by absolute strength)",
+    col.names = c("Predictor", "Correlation (r)", "Direction")
+  )
+
+ggplot(cor_with_adv, aes(x = Variable, y = Correlation, fill = Direction)) +
+  geom_col(width = 0.6) +
+  geom_hline(yintercept = 0, linewidth = 0.4) +
+  geom_text(
+    aes(label = Correlation, vjust = ifelse(Correlation >= 0, -0.4, 1.3)),
+    size = 3.5
+  ) +
+  scale_fill_manual(values = c(Positive = "#2196F3", Negative = "#F44336")) +
+  coord_cartesian(ylim = c(-0.6, 0.6)) +
+  labs(
+    title    = "Pearson Correlation of Each Numeric Predictor with Advertising",
+    subtitle = "Sales shows the strongest positive association",
+    x = NULL, y = "Pearson r"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    legend.position = "top",
+    axis.text.x = element_text(angle = 30, hjust = 1)
+  )
+```
+
+**Finding:** `Sales` and `Population` share the strongest positive correlation with `Advertising` (both r = 0.27). `Income`, `Price`, and all remaining numeric predictors show near-zero correlations with `Advertising`. The dominant signal among numeric predictors is `Sales`.
+
+## Advertising vs Categorical Predictors
+
+```{r anova-cats}
+anova_results <- tibble(
+  Variable = c("ShelveLoc", "US", "Urban"),
+  F_statistic = c(
+    summary(aov(Advertising ~ ShelveLoc, data = Carseats))[[1]][["F value"]][1],
+    summary(aov(Advertising ~ US,        data = Carseats))[[1]][["F value"]][1],
+    summary(aov(Advertising ~ Urban,     data = Carseats))[[1]][["F value"]][1]
+  ),
+  p_value = c(
+    summary(aov(Advertising ~ ShelveLoc, data = Carseats))[[1]][["Pr(>F)"]][1],
+    summary(aov(Advertising ~ US,        data = Carseats))[[1]][["Pr(>F)"]][1],
+    summary(aov(Advertising ~ Urban,     data = Carseats))[[1]][["Pr(>F)"]][1]
+  )
+) %>%
+  mutate(
+    Significant = ifelse(p_value < 0.05, "Yes", "No"),
+    F_statistic = round(F_statistic, 2),
+    p_value     = round(p_value, 4)
+  )
+
+knitr::kable(anova_results,
+  caption = "One-Way ANOVA: Categorical Predictors vs Advertising",
+  col.names = c("Variable", "F Statistic", "p-value", "Significant (alpha = 0.05)")
+)
+```
+
+```{r boxplots-cats, fig.width=10, fig.height=4}
+p_shelve <- ggplot(Carseats, aes(x = ShelveLoc, y = Advertising, fill = ShelveLoc)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c(Bad = "#F44336", Medium = "#FF9800", Good = "#4CAF50")) +
+  labs(title = "Advertising by Shelf Location",
+       x = "Shelf Location", y = "Advertising (thousands)") +
+  theme_bw()
+
+p_us <- ggplot(Carseats, aes(x = US, y = Advertising, fill = US)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c(No = "#90CAF9", Yes = "#1565C0")) +
+  labs(title = "Advertising by US Store",
+       x = "US Store", y = "Advertising (thousands)") +
+  theme_bw()
+
+p_urban <- ggplot(Carseats, aes(x = Urban, y = Advertising, fill = Urban)) +
+  geom_boxplot(alpha = 0.7, show.legend = FALSE) +
+  scale_fill_manual(values = c(No = "#CE93D8", Yes = "#6A1B9A")) +
+  labs(title = "Advertising by Urban Location",
+       x = "Urban", y = "Advertising (thousands)") +
+  theme_bw()
+
+grid.arrange(p_shelve, p_us, p_urban, ncol = 3)
+```
+
+**Finding:** `US` is the only significant categorical predictor (F = 350.80, p < 0.001), with US-based stores spending considerably more on advertising. Both `ShelveLoc` and `Urban` are non-significant (p > 0.05) and are excluded from the model.
+
+## Pairwise Relationships
+
+```{r ggpairs, fig.width=10, fig.height=8}
+Carseats %>%
+  dplyr::select(Advertising, Sales, Price, Income, US) %>%
+  ggpairs(
+    aes(color = US, alpha = 0.4),
+    upper = list(continuous = wrap("cor", size = 3)),
+    lower = list(continuous = wrap("points", alpha = 0.3, size = 0.8)),
+    diag  = list(continuous = wrap("densityDiag", alpha = 0.5))
+  ) +
+  theme_bw(base_size = 10) +
+  ggtitle("Pairwise Relationships Among Final Model Variables")
+```
+
+---
+
+# Model Specification
+
+## Predictor Justification
+
+The model uses **four predictors**:
+
+| Predictor | Type | Justification |
+|-----------|------|---------------|
+| `Sales` | Numeric | Strongest correlation with Advertising (r = 0.27); stores with higher sales invest more in advertising |
+| `Income` | Numeric | Small positive association (r = 0.06); included for contextual relevance as a market-level economic indicator |
+| `Price` | Numeric | Near-zero correlation (r = 0.04); included as a product-level control variable |
+| `US` | Categorical (2 levels) | Highly significant ANOVA result (F = 350.80, p < 0.001); US stores advertise substantially more |
+
+`ShelveLoc` and `Urban` were excluded as non-significant in ANOVA (p > 0.05). `Age`, `Education`, `CompPrice`, and `Population` were excluded based on near-zero correlations.
+
+## Poisson Model Equation
+
+The initial Poisson regression model is expressed as:
+
+$$\log(\hat{\lambda}_i) = \hat{\beta}_0 + \hat{\beta}_1 \cdot \text{Sales} + \hat{\beta}_2 \cdot \text{Income} + \hat{\beta}_3 \cdot \text{Price} + \hat{\beta}_4 \cdot \text{USYes}$$
+
+where $\hat{\lambda}_i$ is the expected advertising spend for store $i$ and `US` uses **No** as the reference level.
+
+---
+
+# Data Splitting
+
+The dataset is split into **80% training** and **20% test** sets, stratified by `US` to preserve the proportion of US and non-US stores in both partitions.
+
+```{r split}
+set.seed(42)
+carseats_split <- initial_split(Carseats, prop = 0.80, strata = US)
+carseats_train <- training(carseats_split)
+carseats_test  <- testing(carseats_split)
+
+cat("Training observations:", nrow(carseats_train), "\n")
+cat("Test observations:    ", nrow(carseats_test),  "\n")
+```
+
+---
+
+# Poisson Model Fitting
+
+We begin with a standard Poisson regression as the baseline count model.
+
+```{r fit-poisson}
+pois_spec <- poisson_reg() %>%
+  set_engine("glm") %>%
+  set_mode("regression")
+
+poisson_model <- pois_spec %>%
+  fit(Advertising ~ Sales + Income + Price + US,
+      data = carseats_train)
+```
+
+## Coefficient Table
+
+```{r coef-table}
+tidy(poisson_model) %>%
+  mutate_if(is.numeric, ~round(., 4)) %>%
+  knitr::kable(
+    caption = "Poisson Regression Coefficients",
+    col.names = c("Term", "Estimate", "Std. Error", "z Statistic", "p-value")
+  )
+```
+
+## Model-Level Statistics
+
+```{r model-stats}
+glance(poisson_model) %>%
+  dplyr::select(null.deviance, deviance, df.null, df.residual, AIC, BIC) %>%
+  mutate_if(is.numeric, ~round(., 3)) %>%
+  knitr::kable(
+    caption = "Poisson Model: Fit Statistics",
+    col.names = c("Null Deviance", "Residual Deviance", "Null df", "Residual df", "AIC", "BIC")
+  )
+```
+
+> **Deviance explained:** `r round((1 - glance(poisson_model)$deviance / glance(poisson_model)$null.deviance) * 100, 1)`%, analogous to R² in linear regression.
+
+---
+
+# Poisson Coefficient Interpretation
+
+In Poisson regression, coefficients are interpreted as **multiplicative effects on the expected count** via exponentiation (Incidence Rate Ratios, IRR):
+
+```{r irr-table}
+tidy(poisson_model) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  mutate(
+    IRR      = round(exp(estimate), 4),
+    estimate = round(estimate, 4)
+  ) %>%
+  dplyr::select(term, estimate, IRR) %>%
+  knitr::kable(
+    caption = "Poisson Model: Incidence Rate Ratios",
+    col.names = c("Predictor", "Log-Scale Estimate", "IRR (exp(coef))")
+  )
+```
+
+- **Sales:** Each one-unit increase in Sales multiplies expected Advertising by approximately 1.13. Stores with higher sales invest proportionally more in advertising.
+- **Income:** IRR near 1.0 indicates virtually no independent effect once other predictors are controlled for.
+- **Price:** Minimal effect on advertising spend once Sales and location are controlled for.
+- **USYes:** US-based stores are expected to advertise substantially more than non-US stores. This is the dominant predictor in the model.
+
+---
+
+# Diagnosing Overdispersion
+
+A core assumption of Poisson regression is that **mean = variance** ($\lambda = \text{Var}(Y)$). We already observed that the raw data has mean = 6.64 but variance = 44.23. Here we formally test this using the dispersion ratio from the fitted model.
+
+```{r overdispersion}
+poisson_glm <- glm(Advertising ~ Sales + Income + Price + US,
+                   family = poisson(link = "log"),
+                   data = carseats_train)
+
+dispersion_ratio <- poisson_glm$deviance / poisson_glm$df.residual
+cat("Dispersion ratio (Residual Deviance / df):", round(dispersion_ratio, 3), "\n")
+cat("Values near 1.0 = good fit | Values >> 1 = overdispersion\n")
+```
+
+```{r poisson-residuals, fig.width=10, fig.height=4}
+test_resid_pois <- carseats_test %>%
+  mutate(
+    .fitted  = predict(poisson_glm, newdata = carseats_test, type = "response"),
+    .pearson = residuals(
+      glm(Advertising ~ Sales + Income + Price + US,
+          family = poisson, data = carseats_test), type = "pearson")
+  )
+
+p1 <- ggplot(test_resid_pois, aes(x = .fitted, y = .pearson)) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(se = FALSE, color = "orange", linewidth = 0.8, method = "loess") +
+  labs(title = "Poisson: Pearson Residuals vs Fitted",
+       subtitle = "Fan shape indicates overdispersion",
+       x = "Fitted Values", y = "Pearson Residuals") +
+  theme_bw()
+
+p2 <- ggplot(test_resid_pois, aes(x = .pearson)) +
+  geom_histogram(bins = 25, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Poisson: Distribution of Pearson Residuals",
+       subtitle = "Heavy tails suggest variance exceeds Poisson assumption",
+       x = "Pearson Residuals", y = "Count") +
+  theme_bw()
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+**What this means:** A dispersion ratio of substantially above 1.0 confirms **overdispersion**. The Poisson model is underestimating uncertainty, which means:
+
+- Standard errors are too small
+- z-statistics are inflated
+- p-values are artificially low, making predictors appear more significant than they truly are
+- The coefficients themselves are still valid, but inference around them is unreliable
+
+**Solution:** We refit using a **Negative Binomial** model, which adds a dispersion parameter $\theta$ to allow variance to exceed the mean:
+
+$$\text{Var}(Y) = \mu + \frac{\mu^2}{\theta}$$
+
+As $\theta \to \infty$, the Negative Binomial converges back to Poisson. For finite $\theta$, it accommodates overdispersion naturally.
+
+---
+
+# Negative Binomial Model
+
+## Fitting the Model
+
+```{r fit-nb}
+nb_model <- MASS::glm.nb(
+  Advertising ~ Sales + Income + Price + US,
+  data = carseats_train
+)
+
+summary(nb_model)
+```
+
+## Coefficient Table
+
+```{r nb-coef-table}
+tidy(nb_model) %>%
+  mutate_if(is.numeric, ~round(., 4)) %>%
+  knitr::kable(
+    caption = "Negative Binomial Regression Coefficients",
+    col.names = c("Term", "Estimate", "Std. Error", "z Statistic", "p-value")
+  )
+```
+
+## Dispersion Parameter
+
+```{r nb-theta}
+cat("Estimated theta (dispersion parameter):", round(nb_model$theta, 4), "\n")
+cat("A smaller theta indicates more overdispersion relative to Poisson.\n")
+```
+
+## Comparing Poisson vs Negative Binomial
+
+```{r model-compare}
+tibble(
+  Model    = c("Poisson", "Negative Binomial"),
+  AIC      = c(AIC(poisson_glm), AIC(nb_model)),
+  Deviance = c(poisson_glm$deviance, nb_model$deviance),
+  df       = c(poisson_glm$df.residual, nb_model$df.residual)
+) %>%
+  mutate(across(where(is.numeric), ~round(., 3))) %>%
+  knitr::kable(caption = "Poisson vs Negative Binomial: Model Comparison")
+```
+
+> **Lower AIC indicates a better model.** The Negative Binomial model is preferred when its AIC is meaningfully lower than the Poisson model.
+
+## Negative Binomial IRR Table
+
+```{r nb-irr}
+tidy(nb_model) %>%
+  dplyr::filter(term != "(Intercept)") %>%
+  mutate(
+    IRR      = round(exp(estimate), 4),
+    estimate = round(estimate, 4),
+    p.value  = round(p.value, 4)
+  ) %>%
+  dplyr::select(term, estimate, IRR, p.value) %>%
+  knitr::kable(
+    caption = "Negative Binomial: Incidence Rate Ratios",
+    col.names = c("Predictor", "Log-Scale Estimate", "IRR (exp(coef))", "p-value")
+  )
+```
+
+---
+
+# Model Evaluation
+
+## Test Set Performance
+
+```{r test-performance}
+# Poisson predictions
+pois_preds <- predict(poisson_glm, newdata = carseats_test, type = "response")
+
+# NB predictions
+nb_preds <- predict(nb_model, newdata = carseats_test, type = "response")
+
+tibble(
+  Model  = c("Poisson", "Negative Binomial"),
+  RMSE   = c(
+    round(sqrt(mean((carseats_test$Advertising - pois_preds)^2)), 4),
+    round(sqrt(mean((carseats_test$Advertising - nb_preds)^2)),   4)
+  ),
+  MAE    = c(
+    round(mean(abs(carseats_test$Advertising - pois_preds)), 4),
+    round(mean(abs(carseats_test$Advertising - nb_preds)),   4)
+  ),
+  Correlation = c(
+    round(cor(carseats_test$Advertising, pois_preds), 4),
+    round(cor(carseats_test$Advertising, nb_preds),   4)
+  )
+) %>%
+  knitr::kable(caption = "Test Set Performance: Poisson vs Negative Binomial")
+```
+
+## Predicted vs Actual (Negative Binomial)
+
+```{r nb-pred-actual, fig.width=6, fig.height=5}
+ggplot(
+  tibble(actual = carseats_test$Advertising, predicted = nb_preds),
+  aes(x = actual, y = predicted)
+) +
+  geom_point(alpha = 0.5, color = "steelblue") +
+  geom_abline(slope = 1, intercept = 0,
+              color = "red", linetype = "dashed", linewidth = 0.8) +
+  labs(
+    title    = "Predicted vs Actual: Negative Binomial (Test Set)",
+    subtitle = "Points close to the diagonal indicate accurate predictions",
+    x = "Actual Advertising (thousands)",
+    y = "Predicted Advertising (thousands)"
+  ) +
+  theme_bw(base_size = 11)
+```
+
+## Residual Diagnostics (Negative Binomial)
+
+```{r nb-diagnostics, fig.width=10, fig.height=8}
+test_resid_nb <- carseats_test %>%
+  mutate(
+    .fitted  = nb_preds,
+    .pearson = (Advertising - nb_preds) / sqrt(nb_preds + nb_preds^2 / nb_model$theta),
+    .devres  = residuals(
+      MASS::glm.nb(Advertising ~ Sales + Income + Price + US,
+                   data = carseats_test), type = "deviance")
+  )
+
+p1 <- ggplot(test_resid_nb, aes(x = .fitted, y = .pearson)) +
+  geom_point(alpha = 0.5, color = "#4CAF50") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(se = FALSE, color = "orange", linewidth = 0.8, method = "loess") +
+  labs(title = "NB: Pearson Residuals vs Fitted",
+       subtitle = "Fan pattern should be reduced vs Poisson",
+       x = "Fitted Values", y = "Pearson Residuals") +
+  theme_bw()
+
+p2 <- ggplot(test_resid_nb, aes(x = .devres)) +
+  geom_histogram(bins = 25, fill = "#4CAF50", color = "white", alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "NB: Distribution of Deviance Residuals",
+       subtitle = "Should be approximately symmetric around zero",
+       x = "Deviance Residuals", y = "Count") +
+  theme_bw()
+
+p3 <- ggplot(test_resid_nb, aes(sample = .devres)) +
+  stat_qq(color = "#4CAF50", alpha = 0.7) +
+  stat_qq_line(color = "red", linewidth = 0.8) +
+  labs(title = "NB: Normal Q-Q Plot",
+       subtitle = "Points should follow the diagonal",
+       x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_bw()
+
+p4 <- ggplot(test_resid_nb, aes(x = .fitted, y = sqrt(abs(.pearson)))) +
+  geom_point(alpha = 0.5, color = "#4CAF50") +
+  geom_smooth(se = FALSE, color = "orange", linewidth = 0.8, method = "loess") +
+  labs(title = "NB: Scale-Location Plot",
+       subtitle = "Flatter line indicates better variance control",
+       x = "Fitted Values", y = "sqrt(|Pearson Residuals|)") +
+  theme_bw()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+**Diagnostic interpretation:**
+
+- **Pearson Residuals vs Fitted:** Compared to Poisson, the fan pattern should be reduced, reflecting the Negative Binomial's better handling of excess variance.
+- **Deviance Residual Histogram:** A roughly symmetric distribution centred near zero indicates adequate fit.
+- **Q-Q Plot:** Some tail deviation is expected with count data but should be less pronounced than the Poisson model.
+- **Scale-Location Plot:** A flatter loess line compared to the Poisson plot indicates that the Negative Binomial model has better variance stability across the fitted range.
+
+---
+
+# Summary
+
+## Final Model Equation (Negative Binomial)
+
+$$\log(\hat{\mu}) = \hat{\beta}_0 + \hat{\beta}_1 \cdot \text{Sales} + \hat{\beta}_2 \cdot \text{Income} + \hat{\beta}_3 \cdot \text{Price} + \hat{\beta}_4 \cdot \text{USYes}$$
+
+where $\hat{\mu}$ is the expected advertising spend and the variance is modelled as $\hat{\mu} + \hat{\mu}^2/\hat{\theta}$, with $\hat{\theta}$ estimated from the data.
+
+## Performance Summary
+
+```{r final-summary, echo=FALSE}
+tibble(
+  Metric = c(
+    "Response Variable",
+    "Initial Model",
+    "Overdispersion Ratio (Poisson)",
+    "Final Model",
+    "Link Function",
+    "Predictors",
+    "Training Observations",
+    "Test Observations",
+    "Strongest Predictor"
+  ),
+  Value = c(
+    "Advertising (count, 0-29)",
+    "Poisson regression",
+    paste0(round(poisson_glm$deviance / poisson_glm$df.residual, 3),
+           " (well above 1.0, confirming overdispersion)"),
+    "Negative Binomial regression",
+    "log",
+    "Sales, Income, Price, US",
+    as.character(nrow(carseats_train)),
+    as.character(nrow(carseats_test)),
+    "US store status (largest IRR)"
+  )
+) %>%
+  knitr::kable(caption = "Final Model: Summary Statistics")
+```
+
+## Key Conclusions
+
+- **Overdispersion ruled out Poisson as the final model.** The raw data showed variance (44.23) far exceeding the mean (6.64), and the fitted Poisson model confirmed a dispersion ratio of well above 1.0. Ignoring this would produce artificially small standard errors and misleading inference.
+
+- **Negative Binomial is the appropriate final model.** By estimating a dispersion parameter $\theta$, it accommodates the excess variance naturally and produces more reliable standard errors and p-values.
+
+- **US store status has the largest effect.** US-based stores are expected to advertise at a substantially higher rate than non-US stores, reflecting differences in market size and competitive dynamics.
+
+- **Sales and advertising are mutually reinforcing.** Stores with higher unit sales invest proportionally more in advertising, consistent with a positive feedback loop between revenue and marketing spend.
+
+- **Income and Price contribute minimally.** Once US status and Sales are in the model, both Income and Price show near-1.0 IRRs, indicating little independent explanatory power for advertising spend.
